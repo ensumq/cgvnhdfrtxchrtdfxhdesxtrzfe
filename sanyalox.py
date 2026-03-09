@@ -1,0 +1,648 @@
+import asyncio
+import logging
+import random
+from collections import deque
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# ВСТАВЬ СЮДА СВОЙ ТОКЕН ОТ BOTFATHER
+BOT_TOKEN = "sanyalox228"
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+games = {}
+global_game_counter = 0
+
+# --- ИГРОВЫЕ КЛАССЫ ---
+
+class Player:
+    def __init__(self, user_id: int, name: str, number: int):
+        self.user_id = user_id
+        self.name = name
+        self.number = number 
+        self.role = None
+        self.is_alive = True
+        self.is_glued = False 
+        self.has_alibi = False
+        
+        # Переменные для ночных способностей
+        self.surikens = 0
+        self.last_healed = None 
+        self.last_alibi = None 
+        self.last_man_heal = False 
+        self.found_mafia = False 
+
+class Game:
+    def __init__(self, chat_id: int):
+        global global_game_counter
+        self.chat_id = chat_id
+        self.players = {} 
+        self.players_by_number = {} 
+        self.state = "LOBBY" 
+        
+        global_game_counter += 1
+        self.game_number = global_game_counter
+        self.day_count = 0
+        self.day_starter_num = 1
+
+        self.nominated = [] 
+        self.speech_queue = deque()
+        self.current_speech_task = None
+        
+        self.voting_queue = deque() 
+        self.current_votes = {} 
+        self.balance_players = [] 
+        self.revote_count = 0 
+        
+        
+        self.night_actions = {} 
+        self.expected_night_actors = {} 
+        self.mafia_team = ["Мафия", "Дон", "Адвокат", "Ниндзя"]
+
+    def add_player(self, user_id: int, name: str):
+        if user_id not in self.players:
+            number = len(self.players) + 1
+            player = Player(user_id, name, number)
+            self.players[user_id] = player
+            self.players_by_number[number] = player
+            return True
+        return False
+
+    def get_alive_players(self):
+        return [p for p in self.players.values() if p.is_alive]
+
+    def build_daily_queue(self):
+        alive = sorted(self.get_alive_players(), key=lambda p: p.number)
+        if not alive: return deque()
+        
+        start_idx = 0
+        for i, p in enumerate(alive):
+            if p.number >= self.day_starter_num:
+                start_idx = i
+                break
+                
+        self.day_starter_num = alive[start_idx].number
+        queue = deque(alive)
+        queue.rotate(-start_idx)
+        return queue
+
+# --- ПРЕСЕТЫ РОЛЕЙ ---
+ROOM_PRESETS = {
+    4: [ 
+        ["Мафия", "Шериф", "Доктор", "Мирный житель"]
+    ],
+    5: [ 
+        ["Мафия", "Шериф", "Доктор", "Мирный житель", "Вор"]
+    ],
+    6: [
+        ["Дон", "Мафия", "Шериф", "Доктор", "Мирный житель", "Мирный житель"],
+        ["Дон", "Мафия", "Шериф", "Тула", "Мирный житель", "Мирный житель"],
+        ["Маньяк с бинтами", "Мафия", "Мирный житель", "Мирный житель", "Мирный житель", "Мирный житель"]
+    ],
+    7: [
+        ["Двуликий", "Дон", "Шериф", "Доктор", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Двуликий", "Дон", "Шериф", "Тула", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Ниндзя", "Мафия", "Тула", "Шериф", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Мафия", "Маньяк с бинтами", "Вор", "Мирный житель", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Бессмертный", "Шериф", "Мафия", "Ниндзя", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Адвокат", "Мафия", "Маньяк с бинтами", "Шериф", "Бессмертный", "Мирный житель", "Мирный житель"]
+    ],
+    8: [
+        ["Адвокат", "Ниндзя", "Маньяк с бинтами", "Бессмертный", "Доктор", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Адвокат", "Ниндзя", "Маньяк с бинтами", "Бессмертный", "Тула", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Двуликий", "Ниндзя", "Маньяк с бинтами", "Бессмертный", "Доктор", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Вор", "Доктор", "Дон", "Ниндзя", "Мирный житель", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Бессмертный", "Вор", "Ниндзя", "Адвокат", "Мирный житель", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Дон", "Ниндзя", "Шериф", "Бессмертный", "Мирный житель", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Маньяк с бинтами", "Мафия", "Мафия", "Шериф", "Доктор", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Дон", "Мафия", "Шериф", "Тула", "Бессмертный", "Маньяк с бинтами", "Мирный житель", "Мирный житель"]
+    ],
+    9: [
+        ["Мафия", "Мафия", "Мафия", "Маньяк с бинтами", "Шериф", "Бессмертный", "Доктор", "Мирный житель", "Мирный житель"],
+        ["Мафия", "Мафия", "Мафия", "Маньяк с бинтами", "Шериф", "Бессмертный", "Тула", "Мирный житель", "Мирный житель"],
+        ["Адвокат", "Двуликий", "Ниндзя", "Маньяк с бинтами", "Доктор", "Бессмертный", "Шериф", "Мирный житель", "Мирный житель"],
+        ["Адвокат", "Двуликий", "Ниндзя", "Маньяк с бинтами", "Тула", "Бессмертный", "Шериф", "Мирный житель", "Мирный житель"],
+        ["Мафия", "Мафия", "Мафия", "Бессмертный", "Вор", "Маньяк с бинтами", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Мафия", "Мафия", "Мафия", "Доктор", "Вор", "Шериф", "Маньяк без бинтов", "Мирный житель", "Мирный житель"]
+    ],
+    10: [
+        ["Мафия", "Мафия", "Мафия", "Маньяк с бинтами", "Шериф", "Бессмертный", "Доктор", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Мафия", "Мафия", "Мафия", "Маньяк с бинтами", "Шериф", "Бессмертный", "Тула", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Адвокат", "Двуликий", "Ниндзя", "Маньяк с бинтами", "Доктор", "Бессмертный", "Шериф", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Адвокат", "Двуликий", "Ниндзя", "Маньяк с бинтами", "Тула", "Бессмертный", "Шериф", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Мафия", "Мафия", "Мафия", "Бессмертный", "Вор", "Маньяк с бинтами", "Мирный житель", "Мирный житель", "Мирный житель", "Мирный житель"],
+        ["Мафия", "Мафия", "Мафия", "Доктор", "Вор", "Шериф", "Маньяк без бинтов", "Мирный житель", "Мирный житель", "Мирный житель"]
+    ]
+    
+}
+
+
+# --- УСЛОВИЯ ПОБЕДЫ ---
+async def check_victory(game: Game, chat_id: int) -> bool:
+    alive = game.get_alive_players()
+    if not alive:
+        await bot.send_message(chat_id, "💀 Все игроки погибли! НИЧЬЯ.")
+        game.state = "FINISHED"
+        return True
+
+    mafia_count = sum(1 for p in alive if p.role in game.mafia_team or (p.role == "Двуликий" and p.found_mafia))
+    maniac_count = sum(1 for p in alive if p.role in ["Маньяк без бинтов", "Маньяк с бинтами"])
+    town_count = len(alive) - mafia_count - maniac_count
+
+    if maniac_count > 0 and len(alive) == 2:
+        await bot.send_message(chat_id, "🔪 Маньяк остался один на один с жертвой! ПОБЕДА МАНЬЯКА!")
+        game.state = "FINISHED"
+        return True
+
+    if mafia_count == 0 and maniac_count == 0:
+        await bot.send_message(chat_id, "🕊 Вся мафия и маньяки уничтожены! ПОБЕДА МИРНОГО ГОРОДА!")
+        game.state = "FINISHED"
+        return True
+
+    if mafia_count >= (town_count + maniac_count) and maniac_count == 0:
+        await bot.send_message(chat_id, "🕴 Мафий за столом стало не меньше, чем мирных! ПОБЕДА МАФИИ!")
+        game.state = "FINISHED"
+        return True
+
+    return False
+
+
+# --- ОБРАБОТЧИКИ БАЗОВЫХ КОМАНД ---
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    if message.chat.type == "private":
+        await message.answer("Привет! Я бот для Мафии 🕵️‍♂️\nЯ запомнил тебя. Теперь добавь меня в группу с друзьями и напиши там /start_game.")
+
+@dp.message(Command("start_game"))
+async def cmd_start_game(message: types.Message):
+    chat_id = message.chat.id
+    if message.chat.type == "private": return await message.answer("Играть нужно в группе!")
+    if chat_id in games and games[chat_id].state not in ["FINISHED"]: return await message.answer("Игра в этом чате уже запущена!")
+
+    games[chat_id] = Game(chat_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✋ Присоединиться", callback_data="join_game")]])
+    await message.answer("Регистрация на Мафию открыта! Нажмите кнопку ниже.", reply_markup=kb)
+
+@dp.callback_query(F.data == "join_game")
+async def join_game_handler(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    game = games.get(chat_id)
+    if not game or game.state != "LOBBY": return await callback.answer("Нет открытого лобби.", show_alert=True)
+        
+    user = callback.from_user
+    if game.add_player(user.id, user.first_name):
+        text = f"Зарегистрировано: {len(game.players)} чел.\n" + "\n".join([f"{p.number}. {p.name}" for p in game.players.values()])
+        await callback.message.edit_text(text, reply_markup=callback.message.reply_markup)
+        await callback.answer("Ты в игре!")
+    else:
+        await callback.answer("Ты уже зарегистрирован!", show_alert=True)
+
+@dp.message(Command("run"))
+async def cmd_run(message: types.Message):
+    chat_id = message.chat.id
+    game = games.get(chat_id)
+    if not game or game.state != "LOBBY": return
+        
+    player_count = len(game.players)
+    if player_count not in ROOM_PRESETS: return await message.answer(f"Для старта нужно другое количество игроков (сейчас {player_count}).")
+        
+    roles = random.choice(ROOM_PRESETS[player_count]).copy()
+    random.shuffle(roles)
+    
+    # Сдвигаем того, кто открывает стол, каждую новую игру
+    game.day_starter_num = ((game.game_number - 1) % player_count) + 1
+    
+    for i, player in enumerate(game.players.values()):
+        player.role = roles[i]
+        try:
+            await bot.send_message(player.user_id, f"Твоя роль: {player.role}")
+        except:
+            return await message.answer(f"Не удалось отправить роль игроку {player.name}. Он не нажал /start в личке с ботом!")
+            
+    game.state = "DAY"
+    game.day_count = 1
+    await start_day_phase(game, chat_id)
+
+
+# --- ФАЗА ДНЯ: РЕЧИ И ВЫСТАВЛЕНИЯ ---
+
+async def start_day_phase(game: Game, chat_id: int):
+    # Если это не первый день игры, передаем право первого слова следующему
+    if game.day_count > 1:
+        alive_nums = sorted([p.number for p in game.get_alive_players()])
+        if alive_nums:
+            next_starter = alive_nums[0] # На случай если дошли до конца круга
+            for num in alive_nums:
+                if num > game.day_starter_num:
+                    next_starter = num
+                    break
+            game.day_starter_num = next_starter
+
+    game.nominated = []
+    game.speech_queue = game.build_daily_queue()
+    if not game.speech_queue: return
+        
+    first_player = game.speech_queue[0]
+    await bot.send_message(chat_id, f"☀️ Наступает День {game.day_count}.\nПервым говорит Игрок №{first_player.number}. Напишите /speech.")
+
+async def next_speaker(game: Game, chat_id: int):
+    if game.speech_queue: game.speech_queue.popleft() 
+    while game.speech_queue and game.speech_queue[0].is_glued:
+        glued_p = game.speech_queue.popleft()
+        await bot.send_message(chat_id, f"🤐 Игрок №{glued_p.number} заклеен Вором и пропускает свою речь.")
+
+    if game.speech_queue:
+        next_p = game.speech_queue[0]
+        await bot.send_message(chat_id, f"🗣 Очередь Игрока №{next_p.number}. Напишите /speech для начала речи.")
+    else:
+        await bot.send_message(chat_id, "🎙 Все речи окончены! Переходим к голосованию. Напишите /start_vote.")
+
+@dp.message(Command("speech"))
+async def cmd_speech(message: types.Message):
+    game = games.get(message.chat.id)
+    if not game or game.state != "DAY" or not game.speech_queue: return
+    player = game.players.get(message.from_user.id)
+    if not player or player.user_id != game.speech_queue[0].user_id: return await message.answer("Сейчас не ваша очередь говорить!")
+    if game.current_speech_task and not game.current_speech_task.done(): return await message.answer("Вы уже выступаете!")
+
+    await message.answer(f"⏱ Игрок №{player.number}, ваша минута пошла!\n"
+                         f"Вы можете выставлять кандидатов: /nominate <номер>\n"
+                         f"Чтобы закончить речь досрочно: /end_speech")
+
+    async def timer_task():
+        try:
+            await asyncio.sleep(60)
+            if player.is_alive and game.state == "DAY":
+                await bot.send_message(message.chat.id, f"🛑 Игрок №{player.number}, время вышло!")
+                await next_speaker(game, message.chat.id)
+        except asyncio.CancelledError: pass
+        finally: game.current_speech_task = None
+
+    game.current_speech_task = asyncio.create_task(timer_task())
+
+@dp.message(Command("end_speech"))
+async def cmd_end_speech(message: types.Message):
+    game = games.get(message.chat.id)
+    if not game or game.state != "DAY" or not game.speech_queue: return
+    player = game.players.get(message.from_user.id)
+    if not player or player.user_id != game.speech_queue[0].user_id: return
+    if game.current_speech_task and not game.current_speech_task.done(): game.current_speech_task.cancel()
+    await message.answer(f"✅ Игрок №{player.number} завершил свою речь.")
+    await next_speaker(game, message.chat.id)
+
+@dp.message(Command("nominate"))
+async def cmd_nominate(message: types.Message):
+    game = games.get(message.chat.id)
+    if not game or game.state != "DAY" or not game.speech_queue: return
+    player = game.players.get(message.from_user.id)
+    if not player or player.user_id != game.speech_queue[0].user_id: return await message.answer("Только во время своей речи!")
+
+    try: target_num = int(message.text.split()[1])
+    except: return await message.answer("Формат: /nominate <номер>")
+
+    if target_num not in game.players_by_number or not game.players_by_number[target_num].is_alive: return await message.answer("Этого игрока нет за столом.")
+    if target_num not in game.nominated:
+        game.nominated.append(target_num)
+        await message.answer(f"👉 Игрок №{target_num} выставлен на голосование.")
+
+@dp.message(Command("nominated"))
+async def cmd_nominated(message: types.Message):
+    game = games.get(message.chat.id)
+    if game and game.nominated: await message.answer("Выставлены: " + ", ".join(map(str, game.nominated)))
+    else: await message.answer("Пока никто не выставлен.")
+
+
+# --- ФАЗА ГОЛОСОВАНИЯ И БАЛАНСА ---
+
+@dp.message(Command("start_vote"))
+async def cmd_start_vote(message: types.Message):
+    game = games.get(message.chat.id)
+    if not game or game.state != "DAY": return
+    if game.current_speech_task and not game.current_speech_task.done(): game.current_speech_task.cancel()
+
+    if not game.nominated:
+        await message.answer("Никто не выставлен. Город засыпает...")
+        await start_night_phase(game, message.chat.id)
+        return
+
+    game.state = "VOTING"
+    game.current_votes = {num: 0 for num in game.nominated}
+    game.voting_queue = game.build_daily_queue() 
+    await message.answer(f"🗳 Начинаем голосование! Выставлены: {game.nominated}.\nПервым голосует Игрок №{game.voting_queue[0].number}. Пишите /vote <номер>")
+
+@dp.message(Command("vote"))
+async def cmd_vote(message: types.Message):
+    game = games.get(message.chat.id)
+    if not game or game.state not in ["VOTING", "REVOTE"]: return
+    player = game.players.get(message.from_user.id)
+    if not player or not game.voting_queue or player.user_id != game.voting_queue[0].user_id: return await message.answer("Сейчас не ваша очередь голосовать!")
+
+    try: target_num = int(message.text.split()[1])
+    except: return await message.answer("Формат: /vote <номер>")
+
+    allowed = game.balance_players if game.state == "REVOTE" else game.nominated
+    if target_num not in allowed: return await message.answer(f"Голосовать можно только за: {allowed}")
+
+    game.current_votes[target_num] += 1
+    game.voting_queue.popleft()
+    await message.answer(f"🗣 Игрок №{player.number} проголосовал против Игрока №{target_num}!")
+
+    if not game.voting_queue: await calculate_votes(game, message.chat.id)
+    else: await message.answer(f"Следующий голосует Игрок №{game.voting_queue[0].number}.")
+
+async def calculate_votes(game: Game, chat_id: int):
+    max_votes = max(game.current_votes.values())
+    leaders = [num for num, votes in game.current_votes.items() if votes == max_votes]
+
+    if len(leaders) == 1:
+        killed_num = leaders[0]
+        if game.players_by_number[killed_num].has_alibi:
+            await bot.send_message(chat_id, f"🛡 Игрок №{killed_num} должен был покинуть стол, но у него оказалось АЛИБИ! Он выживает.")
+        else:
+            game.players_by_number[killed_num].is_alive = False
+            await bot.send_message(chat_id, f"💀 Игрок №{killed_num} покидает стол!")
+            
+        if await check_victory(game, chat_id): return
+        
+        await bot.send_message(chat_id, "Город засыпает...")
+        await start_night_phase(game, chat_id)
+    else:
+        if game.revote_count >= 1:
+            await bot.send_message(chat_id, "⚖️ Голоса снова разделились! Автоматическое оправдание. Город засыпает...")
+            await start_night_phase(game, chat_id)
+            return
+            
+        game.balance_players = leaders
+        game.state = "BALANCE"
+        game.current_votes = {"acquit": 0, "kill": 0, "revote": 0}
+        game.voting_queue = game.build_daily_queue()
+        await bot.send_message(chat_id, f"⚖️ Баланс между: {leaders}.\n1 (Оправдать), 2 (Убить всех), 3 (Переголосовать).\nПишите /balance <1/2/3>. Первым голосует Игрок №{game.voting_queue[0].number}.")
+
+@dp.message(Command("balance"))
+async def cmd_balance_vote(message: types.Message):
+    game = games.get(message.chat.id)
+    if not game or game.state != "BALANCE": return
+    player = game.players.get(message.from_user.id)
+    if not player or not game.voting_queue or player.user_id != game.voting_queue[0].user_id: return
+
+    try: choice = int(message.text.split()[1])
+    except: return
+    if choice not in [1, 2, 3]: return
+
+    options = {1: "acquit", 2: "kill", 3: "revote"}
+    names = {1: "Оправдать", 2: "Убить", 3: "Переголосовать"}
+    
+    game.current_votes[options[choice]] += 1
+    game.voting_queue.popleft()
+    await message.answer(f"🗣 Игрок №{player.number} выбрал: {names[choice]}!")
+
+    if not game.voting_queue: await resolve_balance(game, message.chat.id)
+    else: await message.answer(f"Следующий голосует Игрок №{game.voting_queue[0].number}.")
+
+async def resolve_balance(game: Game, chat_id: int):
+    v = game.current_votes
+    max_v = max(v.values())
+    
+    if v["revote"] == max_v:
+        game.revote_count += 1
+        game.state = "REVOTE"
+        game.current_votes = {num: 0 for num in game.balance_players}
+        game.voting_queue = game.build_daily_queue()
+        await bot.send_message(chat_id, "🔄 ПЕРЕГОЛОСОВАНИЕ! Пишите /vote <номер> за игроков на балансе.")
+    elif v["acquit"] == max_v:
+        await bot.send_message(chat_id, "🕊 Все ОПРАВДАНЫ.")
+        await start_night_phase(game, chat_id)
+    else:
+        killed = []
+        saved = []
+        for num in game.balance_players: 
+            if game.players_by_number[num].has_alibi: saved.append(num)
+            else:
+                game.players_by_number[num].is_alive = False
+                killed.append(num)
+        
+        msg = f"💀 По результатам баланса убиты: {killed if killed else 'никто'}."
+        if saved: msg += f"\n🛡 Спасены алиби: {saved}."
+        await bot.send_message(chat_id, msg)
+        
+        if await check_victory(game, chat_id): return
+        
+        await bot.send_message(chat_id, "Город засыпает...")
+        await start_night_phase(game, chat_id)
+
+
+# --- ФАЗА НОЧИ ДЛЯ ВСЕХ РОЛЕЙ ---
+
+@dp.message(Command("start_night"))
+async def cmd_start_night(message: types.Message):
+    game = games.get(message.chat.id)
+    if not game or game.state in ["LOBBY", "NIGHT", "FINISHED"]: return
+    if game.current_speech_task and not game.current_speech_task.done(): game.current_speech_task.cancel()
+    await message.answer("🌙 Принудительно наступает Ночь! Город засыпает...")
+    await start_night_phase(game, message.chat.id)
+
+async def start_night_phase(game: Game, chat_id: int):
+    game.state = "NIGHT"
+    game.night_actions = {} 
+    game.expected_night_actors = {} 
+    
+    for p in game.players.values():
+        p.is_glued = False
+        p.has_alibi = False
+
+    alive_players = game.get_alive_players()
+    game.mafia_team = ["Мафия", "Дон", "Адвокат", "Ниндзя"]
+    
+    for p in alive_players:
+        actions = []
+        if p.role in game.mafia_team: actions.append(("vote", "Кого убиваем?"))
+        if p.role == "Вор": actions.append(("rek", "Кого будем клеить?"))
+        if p.role == "Доктор": actions.append(("heal", "Кого будем лечить? (нельзя того же, что и вчера)"))
+        if p.role == "Тула": actions.append(("tula", "К кому идем? (хил + алиби)"))
+        if p.role == "Шериф": actions.append(("check_s", "Кого проверим на мафию?"))
+        if p.role == "Дон": actions.append(("check_d", "Кого проверим на Шерифа?"))
+        if p.role == "Адвокат": actions.append(("alibi", "Кому даем алиби на день?"))
+        if p.role == "Ниндзя": actions.append(("sur", "В кого кидаем сюрикен?"))
+        if p.role == "Маньяк без бинтов": actions.append(("man_k", "Кого убиваем?"))
+        if p.role == "Маньяк с бинтами": 
+            actions.append(("man_k", "Кого убиваем? (ИЛИ выберите лечение себя)"))
+            actions.append(("man_h", "Вылечить себя?"))
+        if p.role == "Двуликий":
+            if p.found_mafia: actions.append(("dvul_k", "Кого убиваем?"))
+            else: actions.append(("dvul_j", "Ищем мафию (проверка):"))
+
+        if actions:
+            game.expected_night_actors[p.user_id] = [act[0] for act in actions]
+            game.night_actions[p.user_id] = {}
+            for act_code, text in actions:
+                if act_code == "man_h":
+                    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Лечить себя", callback_data=f"n|{chat_id}|{act_code}|{p.number}")]])
+                else:
+                    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"№{t.number} ({t.name})", callback_data=f"n|{chat_id}|{act_code}|{t.number}")] for t in alive_players])
+                try: await bot.send_message(p.user_id, text, reply_markup=kb)
+                except Exception as e: print(f"Ошибка отправки игроку {p.name}: {e}")
+
+    if not game.expected_night_actors:
+        await resolve_night(game, chat_id)
+
+@dp.callback_query(F.data.startswith("n|"))
+async def handle_night_action(callback: types.CallbackQuery):
+    data = callback.data.split("|")
+    chat_id, act_code, target_num = int(data[1]), data[2], int(data[3])
+    
+    game = games.get(chat_id)
+    if not game or game.state != "NIGHT": return await callback.answer("Ночь уже прошла!", show_alert=True)
+    
+    user_id = callback.from_user.id
+    player = game.players.get(user_id)
+    
+    if not player or user_id not in game.expected_night_actors or act_code not in game.expected_night_actors[user_id]:
+        return await callback.answer("Это действие вам сейчас недоступно.", show_alert=True)
+        
+    if act_code in ["heal", "tula"] and player.last_healed == target_num: return await callback.answer("Нельзя лечить этого игрока две ночи подряд!", show_alert=True)
+    if act_code == "alibi" and player.last_alibi == target_num: return await callback.answer("Нельзя давать алиби этому игроку две ночи подряд!", show_alert=True)
+    if act_code == "man_h" and getattr(player, 'last_man_heal', False): return await callback.answer("Нельзя лечить себя 2 дня подряд!", show_alert=True)
+        
+    game.night_actions[user_id][act_code] = target_num
+    
+    if act_code == "man_k" and "man_h" in game.expected_night_actors[user_id]:
+        game.expected_night_actors[user_id].remove("man_h")
+        player.last_man_heal = False
+    elif act_code == "man_h":
+        game.expected_night_actors[user_id].remove("man_k")
+        player.last_man_heal = True
+
+    game.expected_night_actors[user_id].remove(act_code)
+    await callback.message.edit_text(f"✅ Выбор принят: Игрок №{target_num}")
+    
+    all_done = all(len(acts) == 0 for acts in game.expected_night_actors.values())
+    if all_done: await resolve_night(game, chat_id)
+
+@dp.message(Command("skip_night"))
+async def cmd_skip_night(message: types.Message):
+    game = games.get(message.chat.id)
+    if game and game.state == "NIGHT": await resolve_night(game, message.chat.id)
+
+async def resolve_night(game: Game, chat_id: int):
+    healed = set()
+    mafia_votes = {}
+    killed_this_night = set()
+    mafia_blocked = False
+    putana_client = None
+    
+    actions = []
+    for uid, acts in game.night_actions.items():
+        for code, target in acts.items():
+            actions.append({"actor": game.players[uid], "code": code, "target": game.players_by_number[target]})
+
+    # 1. ВОР (Рэкет)
+    for a in actions:
+        if a["code"] == "rek":
+            a["target"].is_glued = True
+            await bot.send_message(chat_id, f"🤐 Вор заклеил Игрока №{a['target'].number}! Он пропускает день.")
+            if a["target"].role in game.mafia_team: mafia_blocked = True
+
+    # 2. ДОКТОР И ПУТАНА
+    for a in actions:
+        if a["actor"].is_glued: continue
+        if a["code"] == "heal":
+            healed.add(a["target"].number)
+            a["actor"].last_healed = a["target"].number
+            a["target"].surikens = 0 
+        elif a["code"] == "tula":
+            healed.add(a["target"].number)
+            a["target"].has_alibi = True
+            a["actor"].last_healed = a["target"].number
+            a["target"].surikens = 0
+            putana_client = a["target"]
+
+    # 3. АДВОКАТ
+    for a in actions:
+        if a["code"] == "alibi" and not a["actor"].is_glued:
+            a["target"].has_alibi = True
+            a["actor"].last_alibi = a["target"].number
+
+    # 4. НИНДЗЯ
+    for a in actions:
+        if a["code"] == "sur" and not a["actor"].is_glued:
+            if a["target"].number not in healed: a["target"].surikens += 1
+
+    # 5. МАФИЯ
+    mafia_victim = None
+    if not mafia_blocked:
+        for a in actions:
+            if a["code"] == "vote" and not a["actor"].is_glued:
+                weight = 2 if a["actor"].role == "Дон" else 1
+                mafia_votes[a["target"].number] = mafia_votes.get(a["target"].number, 0) + weight
+        if mafia_votes:
+            max_v = max(mafia_votes.values())
+            leaders = [t for t, v in mafia_votes.items() if v == max_v]
+            if leaders: mafia_victim = game.players_by_number[random.choice(leaders)]
+
+    # 6. МАНЬЯКИ И ДВУЛИКИЙ 
+    solo_victims = []
+    for a in actions:
+        if a["actor"].is_glued: continue
+        if a["code"] in ["man_k", "dvul_k"]: solo_victims.append(a["target"])
+
+    # 7. РАСЧЕТ СМЕРТЕЙ
+    if mafia_victim:
+        if mafia_victim.number not in healed and mafia_victim.role != "Бессмертный":
+            killed_this_night.add(mafia_victim.number)
+            if mafia_victim.role == "Тула" and putana_client and putana_client.number != mafia_victim.number:
+                if putana_client.role != "Бессмертный": killed_this_night.add(putana_client.number)
+
+    for victim in solo_victims:
+        if victim.number not in healed and victim.role != "Бессмертный": killed_this_night.add(victim.number)
+
+    for p in game.get_alive_players():
+        if p.surikens >= 2 and p.role != "Бессмертный" and p.number not in healed: killed_this_night.add(p.number)
+
+    # 8. ПРОВЕРКИ 
+    for a in actions:
+        if a["actor"].is_glued: continue
+        
+        if a["code"] == "check_s":
+            if a["target"].role in game.mafia_team: ans = f"✅ Игрок №{a['target'].number} — МАФИЯ ({a['target'].role})!"
+            else: ans = f"❌ Игрок №{a['target'].number} — МИРНЫЙ."
+            await bot.send_message(a["actor"].user_id, ans)
+            
+        elif a["code"] == "check_d":
+            ans = f"✅ Игрок №{a['target'].number} — ШЕРИФ!" if a["target"].role == "Шериф" else f"❌ Игрок №{a['target'].number} — НЕ ШЕРИФ."
+            await bot.send_message(a["actor"].user_id, ans)
+            
+        elif a["code"] == "dvul_j":
+            if a["target"].role in game.mafia_team:
+                a["actor"].found_mafia = True
+                maf_list = ", ".join([f"№{p.number} ({p.role})" for p in game.get_alive_players() if p.role in game.mafia_team])
+                await bot.send_message(a["actor"].user_id, f"🎯 Вы нашли Мафию! Состав: {maf_list}. Со следующей ночи вы убиваете сами.")
+                for maf in game.get_alive_players():
+                    if maf.role in game.mafia_team: await bot.send_message(maf.user_id, f"🎭 Двуликий нашел нас! Это Игрок №{a['actor'].number}.")
+            else:
+                await bot.send_message(a["actor"].user_id, f"❌ Игрок №{a['target'].number} не состоит в Мафии.")
+
+    # 9. ИТОГИ НОЧИ
+    announcement = "☀️ Город просыпается.\n\n"
+    if killed_this_night:
+        for num in killed_this_night: game.players_by_number[num].is_alive = False
+        announcement += f"💀 Этой ночью были убиты: {', '.join(map(str, killed_this_night))}.\n"
+    else:
+        announcement += "🕊 Этой ночью никто не умер!\n"
+        
+    await bot.send_message(chat_id, announcement)
+
+    if await check_victory(game, chat_id): return
+
+    game.day_count += 1
+    game.state = "DAY"
+    await start_day_phase(game, chat_id)
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
