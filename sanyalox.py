@@ -93,7 +93,7 @@ class Game:
 # --- ПРЕСЕТЫ РОЛЕЙ ---
 ROOM_PRESETS = {
     4: [ 
-        ["Мафия", "Дон", "Тула", "Маньяк с бинтами"]
+        ["Вор", "Адвокат", "Бессмертный", "Доктор"]
     ],
     5: [ 
         ["Мафия", "Шериф", "Доктор", "Мирный житель", "Вор"]
@@ -140,6 +140,22 @@ ROOM_PRESETS = {
     
 }
 
+# --- ОПИСАНИЯ РОЛЕЙ (ШПАРГАЛКА) ---
+ROLE_DESCRIPTIONS = {
+    "Мирный житель": "Не имеет ночных способностей. Днем ищет мафию и голосует на суде.",
+    "Мафия": "Ночью вместе с командой выбирает жертву для выстрела.",
+    "Дон": "Глава мафии. Его голос при стрельбе равен двум. Каждую ночь проверяет одного игрока, ища Шерифа.",
+    "Адвокат": "Играет за мафию. Ночью дает одному игроку алиби (спасает от дневной казни на следующий день).",
+    "Ниндзя": "Играет за мафию. Ночью кидает сюрикен. Накопление двух сюрикенов убивает цель. (Лечение снимает сюрикены).",
+    "Вор": "Просыпается первым. Заклеивает рот: цель лишается дневной речи и ночного хода. Если заклеит мафию — отменяет выстрел всей команды.",
+    "Доктор": "Ночью спасает одного игрока от убийства. Нельзя лечить одного и того же два раза подряд.",
+    "Тула": "Ночью лечит игрока и дает ему алиби на день. Если Тулу убьют, ее клиент умирает вместе с ней (кроме Бессмертного).",
+    "Шериф": "Ночью проверяет игрока, узнавая мафия он или нет (Маньяки и Двуликий видятся мирными).",
+    "Маньяк без бинтов": "Играет сам за себя. Каждую ночь убивает одного игрока. Побеждает, оставшись 1 на 1.",
+    "Маньяк с бинтами": "Играет сам за себя. Каждую ночь выбирает: убить игрока ИЛИ вылечить самого себя (нельзя лечить себя 2 ночи подряд).",
+    "Двуликий": "Ночью ищет мафию (проверка). Как только найдет — узнает их состав и со следующей ночи убивает сам.",
+    "Бессмертный": "Неуязвим ночью: не умирает от выстрелов и сюрикенов. Может уйти только на дневном голосовании."
+}
 
 # --- УСЛОВИЯ ПОБЕДЫ ---
 async def check_victory(game: Game, chat_id: int) -> bool:
@@ -241,7 +257,15 @@ async def cmd_run(message: types.Message):
     game.state = "DAY"
     game.day_count = 1
     
-    await message.answer(f"🎲 Игра началась!\nНабор ролей: {', '.join(game.current_preset)}")
+    await message.answer(f"🎲 Игра началась!\nПресет ролей: {', '.join(game.current_preset)}")
+    
+    unique_roles = set(game.current_preset)
+    desc_text = "📖 <b>Справка по ролям на эту игру:</b>\n\n"
+    for r in unique_roles:
+        desc = ROLE_DESCRIPTIONS.get(r, "Описание отсутствует.")
+        desc_text += f"🔹 <b>{r}</b>: {desc}\n\n"
+        
+    await message.answer(desc_text, parse_mode="HTML")
     await start_day_phase(game, chat_id)
 
 @dp.message(Command("alive"))
@@ -689,6 +713,7 @@ async def resolve_night(game: Game, chat_id: int):
     killed_this_night = set()
     putana_client = None
     
+    shurikens_before = {p.number for p in game.get_alive_players() if p.surikens > 0}
     # Мафия заблокирована, если хотя бы один из живых мафиози заклеен Вором
     mafia_blocked = any(p.is_glued for p in game.get_alive_players() if p.role in game.mafia_team)
     
@@ -720,9 +745,15 @@ async def resolve_night(game: Game, chat_id: int):
             a["actor"].last_alibi = a["target"].number
 
     # 3. НИНДЗЯ
+    shurikened_this_night = [] # Создаем список для утреннего объявления
+    
     for a in actions:
         if a["code"] == "sur" and not a["actor"].is_glued:
-            if a["target"].number not in healed: a["target"].surikens += 1
+            # Сюрикен не вешается, если цель полечили
+            if a["target"].number not in healed: 
+                a["target"].surikens += 1
+                shurikened_this_night.append(a["target"].number)
+        
 
     # 4. МАФИЯ
     mafia_victim = None
@@ -752,8 +783,11 @@ async def resolve_night(game: Game, chat_id: int):
             killed_this_night.add(victim.number)
 
     for p in game.get_alive_players():
-        if p.surikens >= 2 and p.role != "Бессмертный" and p.number not in healed: 
-            killed_this_night.add(p.number)
+        if p.surikens >= 2 and p.number not in healed: 
+            if p.role == "Бессмертный":
+                p.surikens = 0 # Сбрасываем счетчик Бессмертному (как при лечении)
+            else:
+                killed_this_night.add(p.number)
 
     # Универсальная проверка смерти Тулы (от мафии, маньяка или сюрикенов)
     for p in game.get_alive_players():
@@ -773,6 +807,17 @@ async def resolve_night(game: Game, chat_id: int):
         announcement += f"💀 Этой ночью были убиты: {', '.join(map(str, killed_this_night))}.\n"
     else:
         announcement += "🕊 Этой ночью никто не умер!\n"
+        
+    # --- СВОДКА ПО СЮРИКЕНАМ ---
+    # Кто потерял сюрикен за эту ночь (вылечили или сбросил Бессмертный)
+    lost_shurikens = [num for num in shurikens_before if game.players_by_number[num].is_alive and game.players_by_number[num].surikens == 0]
+    if lost_shurikens:
+        announcement += f"🩹 Сюрикены были успешно извлечены (сброшены) у игроков: {', '.join(map(str, lost_shurikens))}\n"
+
+    # На ком сейчас висят сюрикены (новые и старые)
+    current_shurikens = [p.number for p in game.get_alive_players() if p.surikens == 1]
+    if current_shurikens:
+        announcement += f"🥷 Внимание! По 1 сюрикену сейчас висит на игроках: {', '.join(map(str, current_shurikens))}\n"
         
     await bot.send_message(chat_id, announcement)
 
