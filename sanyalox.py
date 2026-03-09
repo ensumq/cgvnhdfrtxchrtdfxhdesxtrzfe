@@ -34,6 +34,8 @@ class Player:
         self.last_alibi = None 
         self.last_man_heal = False 
         self.found_mafia = False 
+        self.found_mafia_day = -1
+        self.last_rek = None 
 
 class Game:
     def __init__(self, chat_id: int):
@@ -93,7 +95,7 @@ class Game:
 # --- ПРЕСЕТЫ РОЛЕЙ ---
 ROOM_PRESETS = {
     4: [ 
-        ["Вор", "Адвокат", "Бессмертный", "Доктор"]
+        ["Маньяк с бинтами", "Адвокат", "Двуликий", "Шериф"]
     ],
     5: [ 
         ["Мафия", "Шериф", "Доктор", "Мирный житель", "Вор"]
@@ -145,12 +147,12 @@ ROLE_DESCRIPTIONS = {
     "Мирный житель": "Не имеет ночных способностей. Днем ищет мафию и голосует на суде.",
     "Мафия": "Ночью вместе с командой выбирает жертву для выстрела.",
     "Дон": "Глава мафии. Его голос при стрельбе равен двум. Каждую ночь проверяет одного игрока, ища Шерифа.",
-    "Адвокат": "Играет за мафию. Ночью дает одному игроку алиби (спасает от дневной казни на следующий день).",
+    "Адвокат": "Играет за мафию. Ночью дает одному игроку алиби (спасает от дневной казни на следующий день). Не может дать алиби одному и тому же жителю две ночи подряд",
     "Ниндзя": "Играет за мафию. Ночью кидает сюрикен. Накопление двух сюрикенов убивает цель. (Лечение снимает сюрикены).",
-    "Вор": "Просыпается первым. Заклеивает рот: цель лишается дневной речи и ночного хода. Если заклеит мафию — отменяет выстрел всей команды.",
+    "Вор": "Просыпается первым. Заклеивает рот: цель лишается дневной речи и ночного хода. Если заклеит мафию — отменяет выстрел всей команды. Не может заклеить одного и того же жителя две ночи подряд",
     "Доктор": "Ночью спасает одного игрока от убийства. Нельзя лечить одного и того же два раза подряд.",
-    "Тула": "Ночью лечит игрока и дает ему алиби на день. Если Тулу убьют, ее клиент умирает вместе с ней (кроме Бессмертного).",
-    "Шериф": "Ночью проверяет игрока, узнавая мафия он или нет (Маньяки и Двуликий видятся мирными).",
+    "Тула": "Ночью лечит игрока и дает ему алиби на день. Если Тулу убьют, ее клиент умирает вместе с ней (кроме Бессмертного). Не может ходить к одному и тому же жителю два ночи подряд",
+    "Шериф": "Ночью проверяет игрока, узнавая мафия он или нет (Маньяки  видится мирным всегда, двуликий начинает видеться как мафия со следующей ночи от той, когда он нашел мафию.",
     "Маньяк без бинтов": "Играет сам за себя. Каждую ночь убивает одного игрока. Побеждает, оставшись 1 на 1.",
     "Маньяк с бинтами": "Играет сам за себя. Каждую ночь выбирает: убить игрока ИЛИ вылечить самого себя (нельзя лечить себя 2 ночи подряд).",
     "Двуликий": "Ночью ищет мафию (проверка). Как только найдет — узнает их состав и со следующей ночи убивает сам.",
@@ -161,7 +163,7 @@ ROLE_DESCRIPTIONS = {
 async def check_victory(game: Game, chat_id: int) -> bool:
     alive = game.get_alive_players()
     if not alive:
-        await bot.send_message(chat_id, "💀 Все игроки погибли! НИЧЬЯ.")
+        await bot.send_message(chat_id, "💀 Все игроки погибли! Санек сосет яйца - мафия победила.")
         game.state = "FINISHED"
         return True
 
@@ -641,15 +643,20 @@ async def handle_night_action(callback: types.CallbackQuery):
     if not player or user_id not in game.expected_night_actors or act_code not in game.expected_night_actors[user_id]:
         return await callback.answer("Это действие вам сейчас недоступно.", show_alert=True)
 
-    # --- ОБРАБОТКА ВОРА ---
+    # # --- ОБРАБОТКА ВОРА ---
     if game.state == "NIGHT_THIEF" and act_code == "rek":
+        if target_num != 0 and getattr(player, 'last_rek', None) == target_num:
+            return await callback.answer("Нельзя клеить одного и того же игрока две ночи подряд!", show_alert=True)
+
         game.expected_night_actors[user_id].remove("rek")
         if target_num == 0:
             await callback.message.edit_text("✅ Вы решили никого не клеить.")
             await bot.send_message(chat_id, "🤐 Вор никого не заклеил.")
+            player.last_rek = 0
         else:
             target = game.players_by_number[target_num]
             target.is_glued = True
+            player.last_rek = target_num
             await callback.message.edit_text(f"✅ Вы заклеили Игрока №{target_num}.")
             await bot.send_message(chat_id, f"🤐 Вор заклеил Игрока №{target_num}! Он пропускает день.")
         
@@ -670,13 +677,20 @@ async def handle_night_action(callback: types.CallbackQuery):
         await bot.send_message(user_id, ans)
     elif act_code == "check_s":
         t_player = game.players_by_number[target_num]
-        if t_player.role in game.mafia_team: ans = f"✅ Игрок №{target_num} — МАФИЯ ({t_player.role})!"
-        else: ans = f"❌ Игрок №{target_num} — МИРНЫЙ."
+        
+        # Двуликий видится черным только со СЛЕДУЮЩЕЙ ночи после того, как нашел мафию
+        is_bad_dvul = (t_player.role == "Двуликий" and getattr(t_player, 'found_mafia', False) and getattr(t_player, 'found_mafia_day', -1) < game.day_count)
+        
+        if t_player.role in game.mafia_team or is_bad_dvul: 
+            ans = f"✅ Игрок №{target_num} — МАФИЯ ({t_player.role})!"
+        else: 
+            ans = f"❌ Игрок №{target_num} — НЕ МАФИЯ."
         await bot.send_message(user_id, ans)
     elif act_code == "dvul_j":
         t_player = game.players_by_number[target_num]
         if t_player.role in game.mafia_team:
             player.found_mafia = True
+            player.found_mafia_day = game.day_count
             maf_list = ", ".join([f"№{p.number} ({p.role})" for p in game.get_alive_players() if p.role in game.mafia_team])
             await bot.send_message(user_id, f"🎯 Вы нашли Мафию! Состав: {maf_list}. Со следующей ночи вы убиваете сами.")
             for maf in game.get_alive_players():
@@ -832,3 +846,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+#саня лох
