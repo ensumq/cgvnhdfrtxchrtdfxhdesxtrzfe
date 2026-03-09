@@ -27,6 +27,7 @@ class Player:
         self.is_alive = True
         self.is_glued = False 
         self.has_alibi = False
+        self.has_nominated = False
         
         # Переменные для ночных способностей
         self.surikens = 0
@@ -245,8 +246,8 @@ async def cmd_run(message: types.Message):
     
     # 3. Рассылаем роли
     for player in game.players.values():
-        msg = f"Твоя роль: {player.role}"
         
+        msg = f"🔢 Твой игровой номер: {player.number}\n🎭 Твоя роль: {player.role}\n\n📖 Что делает твоя роль:\n{ROLE_DESCRIPTIONS[player.role]}"
         # Если игрок — мафия, приклеиваем список союзников
         if player.role in game.mafia_team:
             msg += f"\n\n🕴 Твоя команда:\n{mafia_text}\n\n*Ночью вы можете общаться с командой прямо здесь, отправляя сообщения боту!*"
@@ -259,7 +260,7 @@ async def cmd_run(message: types.Message):
     game.state = "DAY"
     game.day_count = 1
     
-    await message.answer(f"🎲 Игра началась!\nПресет ролей: {', '.join(game.current_preset)}")
+    await message.answer(f"🎲 Игра началась!\nНабор ролей: {', '.join(game.current_preset)}")
     
     unique_roles = set(game.current_preset)
     desc_text = "📖 <b>Справка по ролям на эту игру:</b>\n\n"
@@ -333,6 +334,8 @@ async def cmd_roles(message: types.Message):
 # --- ФАЗА ДНЯ: РЕЧИ И ВЫСТАВЛЕНИЯ ---
 
 async def start_day_phase(game: Game, chat_id: int):
+    for p in game.players.values():
+        p.has_nominated = False
     # Если это не первый день игры, передаем право первого слова следующему
     if game.day_count > 1:
         alive_nums = sorted([p.number for p in game.get_alive_players()])
@@ -401,15 +404,27 @@ async def cmd_nominate(message: types.Message):
     game = games.get(message.chat.id)
     if not game or game.state != "DAY" or not game.speech_queue: return
     player = game.players.get(message.from_user.id)
-    if not player or player.user_id != game.speech_queue[0].user_id: return await message.answer("Только во время своей речи!")
+    if not player or player.user_id != game.speech_queue[0].user_id: return
 
     try: target_num = int(message.text.split()[1])
     except: return await message.answer("Формат: /nominate <номер>")
 
-    if target_num not in game.players_by_number or not game.players_by_number[target_num].is_alive: return await message.answer("Этого игрока нет за столом.")
+    if target_num not in game.players_by_number or not game.players_by_number[target_num].is_alive:
+        return
+
+    # 1. Сначала проверяем: выставлял ли игрок уже кого-то сегодня?
+    if player.has_nominated:
+        return await message.answer("⚠️ Вы уже выставили одного кандидата на этом кругу!")
+
+    # 2. Если не выставлял и кандидат еще не в списке — добавляем
     if target_num not in game.nominated:
         game.nominated.append(target_num)
+        player.has_nominated = True # Запоминаем, что игрок использовал свое право
         await message.answer(f"👉 Игрок №{target_num} выставлен на голосование.")
+    else:
+        # Если такого игрока уже кто-то выставил до него
+        await message.answer("⚠️ Этот игрок уже выставлен на голосование!")
+
 
 @dp.message(Command("nominated"))
 async def cmd_nominated(message: types.Message):
