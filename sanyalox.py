@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 from collections import deque
+from aiogram.types import Message
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -160,6 +161,8 @@ ROLE_DESCRIPTIONS = {
     "Бессмертный": "Неуязвим ночью: не умирает от выстрелов и сюрикенов. Может уйти только на дневном голосовании."
 }
 
+
+
 # --- УСЛОВИЯ ПОБЕДЫ ---
 async def check_victory(game: Game, chat_id: int) -> bool:
     alive = game.get_alive_players()
@@ -174,6 +177,7 @@ async def check_victory(game: Game, chat_id: int) -> bool:
 
     if maniac_count > 0 and len(alive) == 2:
         await bot.send_message(chat_id, "🔪 Маньяк остался один на один с жертвой! ПОБЕДА МАНЬЯКА!")
+        
         game.state = "FINISHED"
         return True
 
@@ -336,6 +340,10 @@ async def cmd_roles(message: types.Message):
 async def start_day_phase(game: Game, chat_id: int):
     for p in game.players.values():
         p.has_nominated = False
+        
+    # ДОБАВЛЕНО: Обнуляем счетчик переголосований каждое утро
+    game.revote_count = 0 
+    
     # Если это не первый день игры, передаем право первого слова следующему
     if game.day_count > 1:
         alive_nums = sorted([p.number for p in game.get_alive_players()])
@@ -531,7 +539,8 @@ async def resolve_balance(game: Game, chat_id: int):
         game.voting_queue = game.build_daily_queue()
         await bot.send_message(chat_id, "🔄 ПЕРЕГОЛОСОВАНИЕ! Пишите /vote <номер> за игроков на балансе.")
     elif v["acquit"] == max_v:
-        await bot.send_message(chat_id, "🕊 Все ОПРАВДАНЫ.")
+        # ДОБАВЛЕНО: Сообщение о том, что город засыпает
+        await bot.send_message(chat_id, "🕊 Все ОПРАВДАНЫ.\nГород засыпает...")
         await start_night_phase(game, chat_id)
     else:
         killed = []
@@ -542,15 +551,19 @@ async def resolve_balance(game: Game, chat_id: int):
                 game.players_by_number[num].is_alive = False
                 killed.append(num)
         
-        msg = f"💀 По результатам баланса убиты: {killed if killed else 'никто'}."
-        if saved: msg += f"\n🛡 Спасены алиби: {saved}."
+        # ДОБАВЛЕНО: Красивое форматирование списков
+        killed_str = ", ".join(map(str, killed)) if killed else "никто"
+        msg = f"💀 По результатам баланса убиты: {killed_str}."
+        if saved: 
+            saved_str = ", ".join(map(str, saved))
+            msg += f"\n🛡 Спасены алиби: {saved_str}."
+            
         await bot.send_message(chat_id, msg)
         
         if await check_victory(game, chat_id): return
         
         await bot.send_message(chat_id, "Город засыпает...")
         await start_night_phase(game, chat_id)
-
 
 # --- ФАЗА НОЧИ ДЛЯ ВСЕХ РОЛЕЙ ---
 
